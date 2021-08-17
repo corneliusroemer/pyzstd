@@ -63,6 +63,28 @@ typedef struct {
 } ZstdCompressor;
 
 typedef struct {
+    /* Buffer */
+    char *buffer;
+    size_t buffer_size;
+
+    /* Used size */
+    size_t used;
+    /* Positions */
+    size_t begin, end;
+    /* Across the border, 0 or 1. */
+    uint8_t across;
+
+    /* Has subsequent chunk */
+    uint8_t has_next;
+
+    /* Shrink count */
+    uint32_t shrink_count;
+
+    /* Input data */
+    Py_buffer *input_data;
+} RollingInputBuffer;
+
+typedef struct {
     PyObject_HEAD
 
     /* Decompression context */
@@ -72,9 +94,7 @@ typedef struct {
     PyObject *dict;
 
     /* Unconsumed input data */
-    char *input_buffer;
-    size_t input_buffer_size;
-    size_t in_begin, in_end;
+    RollingInputBuffer rolling_input_buffer;
 
     /* Thread lock for compressing */
     PyThread_type_lock lock;
@@ -115,6 +135,35 @@ typedef struct {
 } _zstd_state;
 
 static _zstd_state static_state;
+
+/* ------------------
+     Global macros
+   ------------------ */
+#define ACQUIRE_LOCK(obj) do {                    \
+    if (!PyThread_acquire_lock((obj)->lock, 0)) { \
+        Py_BEGIN_ALLOW_THREADS                    \
+        PyThread_acquire_lock((obj)->lock, 1);    \
+        Py_END_ALLOW_THREADS                      \
+    } } while (0)
+#define RELEASE_LOCK(obj) PyThread_release_lock((obj)->lock)
+
+/* Force inlining */
+#if defined(__GNUC__) || defined(__ICCARM__)
+#  define FORCE_INLINE static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#  define FORCE_INLINE static inline __forceinline
+#else
+#  define FORCE_INLINE static inline
+#endif
+
+/* Force no inlining */
+#if defined(__GNUC__) || defined(__ICCARM__)
+#  define FORCE_NO_INLINE static __attribute__((__noinline__))
+#elif defined(_MSC_VER)
+#  define FORCE_NO_INLINE static __declspec(noinline)
+#else
+#  define FORCE_NO_INLINE static
+#endif
 
 /* ----------------------------
      BlocksOutputBuffer code
@@ -393,34 +442,272 @@ OutputBuffer_OnError(BlocksOutputBuffer *buffer)
     Py_CLEAR(buffer->list);
 }
 
-/* ------------------
-     Global macros
-   ------------------ */
-#define ACQUIRE_LOCK(obj) do {                    \
-    if (!PyThread_acquire_lock((obj)->lock, 0)) { \
-        Py_BEGIN_ALLOW_THREADS                    \
-        PyThread_acquire_lock((obj)->lock, 1);    \
-        Py_END_ALLOW_THREADS                      \
-    } } while (0)
-#define RELEASE_LOCK(obj) PyThread_release_lock((obj)->lock)
+/* ----------------------------
+     RollingInputBuffer code
+   ---------------------------- */
 
-/* Force inlining */
-#if defined(__GNUC__) || defined(__ICCARM__)
-#  define FORCE_INLINE static inline __attribute__((always_inline))
-#elif defined(_MSC_VER)
-#  define FORCE_INLINE static inline __forceinline
-#else
-#  define FORCE_INLINE static inline
-#endif
+/* When not across the border (r->across == 0):
+    -----========------
+         b       e
+    -----------========
+               b       e
+   When across the border (r->across == 1):
+    ====---------======
+        e        b
+    ===================
+           | b and e are at the same position
+*/
 
-/* Force no inlining */
-#if defined(__GNUC__) || defined(__ICCARM__)
-#  define FORCE_NO_INLINE static __attribute__((__noinline__))
-#elif defined(_MSC_VER)
-#  define FORCE_NO_INLINE static __declspec(noinline)
-#else
-#  define FORCE_NO_INLINE static
-#endif
+#define NEW_BUFFER_SIZE(data_size)  ((data_size) + ((data_size) >> 3))
+
+#define SHRINK_FACTOR 6
+#define SHRINK_MIN    (20*1024*1024)
+
+FORCE_INLINE void
+InputBuffer_Enter(RollingInputBuffer *r, Py_buffer *input,
+                  ZSTD_inBuffer *in)
+{
+    /* This function must set .has_next and .input_data */
+
+    if (r->used == 0) {
+        /* Use input data */
+        in->src = input->buf;
+        in->size = input->len;
+        in->pos = 0;
+
+        r->has_next = 0;
+        r->input_data = (input->len != 0) ? input : NULL;
+    } else {
+        /* Use buffer */
+        in->src = r->buffer + r->begin;
+        in->size = !r->across ? r->used : (r->buffer_size - r->begin);
+        in->pos = 0;
+
+        /* Input data */
+        if (input->len != 0) {
+            r->has_next = 1;
+            r->input_data = input;
+        } else {
+            r->has_next = r->across;
+            r->input_data = NULL;
+        }
+    }
+}
+
+FORCE_INLINE int
+InputBuffer_HasUnconsumedData(RollingInputBuffer *r, ZSTD_inBuffer *in)
+{
+    return in->pos != in->size || r->has_next;
+}
+
+FORCE_INLINE int
+InputBuffer_HasNextChunk(RollingInputBuffer *r)
+{
+    return r->has_next;
+}
+
+FORCE_INLINE void
+InputBuffer_NextChunk(RollingInputBuffer *r, ZSTD_inBuffer *in)
+{
+    /* Ensure the chunk has been unconsumed */
+    assert(in->pos == in->size);
+    assert(in->pos != 0);
+    /* If (.used == 0), should not call this function. */
+    assert(r->used != 0);
+
+    /* Use buffer */
+    r->used -= in->pos;
+    r->begin += in->pos;
+
+    if (r->used == 0) {
+        /* Buffer exhausted */
+        assert(!r->across);
+        r->begin = 0;
+        r->end = 0;
+        r->has_next = 0;
+
+        /* If (.input_data == NULL), should not call this function. */
+        assert(r->input_data);
+        in->src = r->input_data->buf;
+        in->size = r->input_data->len;
+        in->pos = 0;
+    } else if (r->begin == r->buffer_size) {
+        /* Next buffer chunk */
+        assert(r->across); /* If false, (.used == 0), can't reach here. */
+        assert(r->end != 0);
+
+        r->begin = 0;
+        r->across = 0;
+        r->has_next = r->input_data ? 1 : 0;
+
+        in->src = r->buffer;
+        in->size = r->end;
+        in->pos = 0;
+    } else {
+        Py_UNREACHABLE();
+    }
+}
+
+/* If has unconsumed data, return 1.
+   If no unconsumed data, return 0.
+   If fails, return -1. */
+FORCE_INLINE int
+InputBuffer_Exit(RollingInputBuffer *r, ZSTD_inBuffer *in)
+{
+    int use_buffer;
+    int has_unconsumed;
+
+    /* Buffer */
+    use_buffer = (r->used != 0) ? 1 : 0;
+    if (r->used && in->pos != 0) {
+        r->used -= in->pos;
+        r->begin += in->pos;
+
+        if (r->used == 0) {
+            assert(!r->across);
+            r->begin = 0;
+            r->end = 0;
+        } else if (r->begin == r->buffer_size) {
+            /* If (!.across), then (.used == 0), can't reach here. */
+            assert(r->across);
+            assert(r->end != 0);
+            r->begin = 0;
+            r->across = 0;
+        }
+    }
+    has_unconsumed = (r->used != 0) ? 1 : 0;
+
+    if (r->input_data) {
+        size_t input_data_size;
+        char *input_data_buffer;
+
+        if (use_buffer) {
+            input_data_size = r->input_data->len;
+            input_data_buffer = r->input_data->buf;
+        } else {
+            input_data_size = in->size - in->pos;
+            if (input_data_size == 0) {
+                return has_unconsumed;
+            }
+            input_data_buffer = (char*)in->src + in->pos;
+        }
+        has_unconsumed |= 1;
+
+        /* Total space is not enough */
+        if (input_data_size > r->buffer_size - r->used) {
+            const size_t new_data_size = r->used + input_data_size;
+            const size_t new_buffer_size = NEW_BUFFER_SIZE(new_data_size);
+            char *tmp;
+
+            tmp = PyMem_Malloc(new_buffer_size);
+            if (tmp == NULL) {
+                PyErr_NoMemory();
+                return -1;
+            }
+
+            /* Memory copy */
+            if (!r->across) {
+                memcpy(tmp, r->buffer + r->begin, r->used);
+            } else {
+                /* The first part */
+                const size_t first_size = r->buffer_size - r->begin;
+                memcpy(tmp, r->buffer + r->begin, first_size);
+                /* The second part */
+                memcpy(tmp + first_size, r->buffer, r->end);
+
+                r->across = 0;
+            }
+
+            /* Switch to new buffer */
+            PyMem_Free(r->buffer);
+            r->buffer = tmp;
+            r->buffer_size = new_buffer_size;
+
+            r->begin = 0;
+            r->end = r->used;
+        }
+
+        /* Copy input data */
+        if (r->across || input_data_size <= r->buffer_size - r->end) {
+            /* Contiguous:
+               1. ====----=== or
+               2. --====----- (tail space is enough) */
+            memcpy(r->buffer + r->end, input_data_buffer, input_data_size);
+            r->used += input_data_size;
+            r->end += input_data_size;
+        } else {
+            /* The first part, can be 0.
+            ----======aaa  */
+            size_t first_size = r->buffer_size - r->end;
+            memcpy(r->buffer + r->end, input_data_buffer, first_size);
+
+            /* The second part, must > 0.
+            bb--======aaa */
+            const size_t second_size = input_data_size - first_size;
+            assert(second_size > 0);
+            memcpy(r->buffer, input_data_buffer + first_size, second_size);
+
+            r->used += input_data_size;
+            r->end = second_size;
+            r->across = 1;
+        }
+    }
+
+    return has_unconsumed;
+}
+
+/* If succeeds, the input buffer will be cleared. */
+FORCE_INLINE PyObject*
+InputBuffer_GetUnusedAndClear(RollingInputBuffer *r)
+{
+    PyObject *ret;
+
+    if (r->used == 0) {
+        /* No unused data */
+        ret = static_state.empty_bytes;
+        Py_INCREF(ret);
+    } else {
+        if (!r->across) {
+            /* Not across */
+            ret = PyBytes_FromStringAndSize(r->buffer + r->begin, r->used);
+        } else {
+            /* Across */
+            ret = PyByteArray_FromStringAndSize(NULL, r->used);
+            if (ret == NULL) {
+                return NULL;
+            }
+
+            /* The first part */
+            const size_t first_size = r->buffer_size - r->begin;
+            memcpy(PyBytes_AS_STRING(ret), r->buffer + r->begin, first_size);
+            /* The second part */
+            memcpy(PyBytes_AS_STRING(ret) + first_size, r->buffer, r->end);
+        }
+    }
+
+    /* Clear input buffer */
+    if (r->buffer) {
+        PyMem_Free(r->buffer);
+        r->buffer = NULL;
+    }
+
+    return ret;
+}
+
+FORCE_INLINE void
+InputBuffer_Reset(RollingInputBuffer *r)
+{
+    r->used = 0;
+    r->begin = 0;
+    r->end = 0;
+    r->across = 0;
+}
+
+FORCE_INLINE void
+InputBuffer_Free(RollingInputBuffer *r)
+{
+    PyMem_Free(r->buffer);
+}
 
 /* -------------------------
      Parameters from zstd
@@ -2120,7 +2407,9 @@ decompress_impl(ZstdDecompressor *self, ZSTD_inBuffer *in,
             self->at_frame_edge = (zstd_ret == 0) ? 1 : 0;
 
             /* The second AFE check for setting .at_frame_edge flag */
-            if (self->at_frame_edge && in->pos == in->size) {
+            if (self->at_frame_edge &&
+                !InputBuffer_HasUnconsumedData(&self->rolling_input_buffer, in))
+            {
                 break;
             }
         }
@@ -2142,8 +2431,11 @@ decompress_impl(ZstdDecompressor *self, ZSTD_inBuffer *in,
             assert(out.pos == 0);
 
         } else if (in->pos == in->size) {
-            /* Finished */
-            break;
+            if (InputBuffer_HasNextChunk(&self->rolling_input_buffer)) {
+                InputBuffer_NextChunk(&self->rolling_input_buffer, in);
+            } else {
+                break;
+            }
         }
     }
 
@@ -2170,7 +2462,7 @@ stream_decompress(ZstdDecompressor *self, PyObject *args, PyObject *kwargs,
     Py_ssize_t initial_buffer_size = -1;
     ZSTD_inBuffer in;
     PyObject *ret = NULL;
-    char use_input_buffer;
+    int has_unconsumed;
 
     if (!PyArg_ParseTupleAndKeywords(args, kwargs,
                                      "y*|n:ZstdDecompressor.decompress", kwlist,
@@ -2190,7 +2482,7 @@ stream_decompress(ZstdDecompressor *self, PyObject *args, PyObject *kwargs,
         }
     } else if (type == TYPE_ENDLESS_DECOMPRESSOR) {
         /* Fast path for the first frame */
-        if (self->at_frame_edge && self->in_begin == self->in_end) {
+        if (self->at_frame_edge && self->rolling_input_buffer.used == 0) {
             /* Read decompressed size */
             uint64_t decompressed_size = ZSTD_getFrameContentSize(data.buf, data.len);
 
@@ -2209,85 +2501,7 @@ stream_decompress(ZstdDecompressor *self, PyObject *args, PyObject *kwargs,
         }
     }
 
-    /* Prepare input buffer w/wo unconsumed data */
-    if (self->in_begin == self->in_end) {
-        /* No unconsumed data */
-        use_input_buffer = 0;
-
-        in.src = data.buf;
-        in.size = data.len;
-        in.pos = 0;
-    } else if (data.len == 0) {
-        /* Has unconsumed data, fast path for b'' */
-        assert(self->in_begin < self->in_end);
-
-        use_input_buffer = 1;
-
-        in.src = self->input_buffer + self->in_begin;
-        in.size = self->in_end - self->in_begin;
-        in.pos = 0;
-    } else {
-        /* Has unconsumed data */
-        use_input_buffer = 1;
-
-        /* Unconsumed data size in input_buffer */
-        const size_t used_now = self->in_end - self->in_begin;
-        assert(self->in_end > self->in_begin);
-
-        /* Number of bytes we can append to input buffer */
-        const size_t avail_now = self->input_buffer_size - self->in_end;
-        assert(self->input_buffer_size >= self->in_end);
-
-        /* Number of bytes we can append if we move existing contents to
-           beginning of buffer */
-        const size_t avail_total = self->input_buffer_size - used_now;
-        assert(self->input_buffer_size >= used_now);
-
-        if (avail_total < (size_t) data.len) {
-            char *tmp;
-            const size_t new_size = used_now + data.len;
-
-            /* Allocate with new size */
-            tmp = PyMem_Malloc(new_size);
-            if (tmp == NULL) {
-                PyErr_NoMemory();
-                goto error;
-            }
-
-            /* Copy unconsumed data to the beginning of new buffer */
-            memcpy(tmp,
-                   self->input_buffer + self->in_begin,
-                   used_now);
-
-            /* Switch to new buffer */
-            PyMem_Free(self->input_buffer);
-            self->input_buffer = tmp;
-            self->input_buffer_size = new_size;
-
-            /* Set begin & end position */
-            self->in_begin = 0;
-            self->in_end = used_now;
-        } else if (avail_now < (size_t) data.len) {
-            /* Move unconsumed data to the beginning.
-               dst < src, so using memcpy() is safe. */
-            memcpy(self->input_buffer,
-                   self->input_buffer + self->in_begin,
-                   used_now);
-
-            /* Set begin & end position */
-            self->in_begin = 0;
-            self->in_end = used_now;
-        }
-
-        /* Copy data to input buffer */
-        memcpy(self->input_buffer + self->in_end, data.buf, data.len);
-        self->in_end += data.len;
-
-        in.src = self->input_buffer + self->in_begin;
-        in.size = used_now + data.len;
-        in.pos = 0;
-    }
-    assert(in.pos == 0);
+    InputBuffer_Enter(&self->rolling_input_buffer, &data, &in);
 
     /* Decompress */
     ret = decompress_impl(self, &in,
@@ -2297,8 +2511,13 @@ stream_decompress(ZstdDecompressor *self, PyObject *args, PyObject *kwargs,
         goto error;
     }
 
-    /* Unconsumed input data */
-    if (in.pos == in.size) {
+    has_unconsumed = InputBuffer_Exit(&self->rolling_input_buffer, &in);
+    if (has_unconsumed < 0) {
+        goto error;
+    }
+
+    /* Set flags */
+    if (!has_unconsumed) {
         if (type == TYPE_DECOMPRESSOR) {
             if (Py_SIZE(ret) == max_length || self->eof) {
                 self->needs_input = 0;
@@ -2312,15 +2531,7 @@ stream_decompress(ZstdDecompressor *self, PyObject *args, PyObject *kwargs,
                 self->needs_input = 1;
             }
         }
-
-        if (use_input_buffer) {
-            /* Clear input_buffer */
-            self->in_begin = 0;
-            self->in_end = 0;
-        }
     } else {
-        const size_t data_size = in.size - in.pos;
-
         /*if (type == DECOMPRESSOR) {
             if (self->eof) {
                 self->needs_input = 0;
@@ -2338,44 +2549,13 @@ stream_decompress(ZstdDecompressor *self, PyObject *args, PyObject *kwargs,
             }*/
             self->at_frame_edge = 0;
         }
-
-        if (!use_input_buffer) {
-            /* Discard buffer if it's too small
-               (resizing it may needlessly copy the current contents) */
-            if (self->input_buffer != NULL &&
-                self->input_buffer_size < data_size)
-            {
-                PyMem_Free(self->input_buffer);
-                self->input_buffer = NULL;
-                self->input_buffer_size = 0;
-            }
-
-            /* Allocate if necessary */
-            if (self->input_buffer == NULL) {
-                self->input_buffer = PyMem_Malloc(data_size);
-                if (self->input_buffer == NULL) {
-                    PyErr_NoMemory();
-                    goto error;
-                }
-                self->input_buffer_size = data_size;
-            }
-
-            /* Copy unconsumed data */
-            memcpy(self->input_buffer, (char*)in.src + in.pos, data_size);
-            self->in_begin = 0;
-            self->in_end = data_size;
-        } else {
-            /* Use input buffer */
-            self->in_begin += in.pos;
-        }
     }
 
     goto success;
 
 error:
     /* Reset variables */
-    self->in_begin = 0;
-    self->in_end = 0;
+    InputBuffer_Reset(&self->rolling_input_buffer);
 
     self->needs_input = 1;
     if (type == TYPE_DECOMPRESSOR) {
@@ -2408,10 +2588,6 @@ ZstdDecompressor_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     }
 
     assert(self->dict == NULL);
-    assert(self->input_buffer == NULL);
-    assert(self->input_buffer_size == 0);
-    assert(self->in_begin == 0);
-    assert(self->in_end == 0);
     assert(self->unused_data == NULL);
     assert(self->eof == 0);
     assert(self->inited == 0);
@@ -2453,7 +2629,7 @@ ZstdDecompressor_dealloc(ZstdDecompressor *self)
     Py_XDECREF(self->dict);
 
     /* Free unconsumed input data buffer */
-    PyMem_Free(self->input_buffer);
+    InputBuffer_Free(&self->rolling_input_buffer);
 
     /* Free unused data */
     Py_XDECREF(self->unused_data);
@@ -2532,9 +2708,8 @@ unused_data_get(ZstdDecompressor *self, void *Py_UNUSED(ignored))
         Py_INCREF(ret);
     } else {
         if (self->unused_data == NULL) {
-            self->unused_data = PyBytes_FromStringAndSize(
-                                    self->input_buffer + self->in_begin,
-                                    self->in_end - self->in_begin);
+            self->unused_data = InputBuffer_GetUnusedAndClear(
+                                    &self->rolling_input_buffer);
             ret = self->unused_data;
             Py_XINCREF(ret);
         } else {
@@ -2544,7 +2719,6 @@ unused_data_get(ZstdDecompressor *self, void *Py_UNUSED(ignored))
     }
 
     RELEASE_LOCK(self);
-
     return ret;
 }
 
