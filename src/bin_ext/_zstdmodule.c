@@ -63,6 +63,29 @@ typedef struct {
 } ZstdCompressor;
 
 typedef struct {
+    /* Buffer */
+    char *buffer;
+    size_t buffer_size;
+
+    /* Used size */
+    size_t used;
+    /* Positions */
+    size_t begin, end;
+    /* Across the border, 0 or 1. */
+    uint8_t across;
+
+    /* Current stage, 1 buffer, 2 input data. */
+    uint8_t stage;
+    /* Has next chunk */
+    uint8_t has_next;
+    /* Shrink count */
+    uint8_t shrink_count;
+
+    /* Input data */
+    Py_buffer *input_data;
+} RollingInputBuffer;
+
+typedef struct {
     PyObject_HEAD
 
     /* Decompression context */
@@ -391,6 +414,279 @@ static inline void
 OutputBuffer_OnError(BlocksOutputBuffer *buffer)
 {
     Py_CLEAR(buffer->list);
+}
+
+/* ----------------------------
+     RollingInputBuffer code
+   ---------------------------- */
+#define NEW_BUFFER_SIZE(data_size)  (data_size + (data_size >> 3))
+#define SHRINK_MIN      (10*1024*1024)
+#define SHRINK_FACTOR   6
+
+static inline uint8_t
+InputBuffer_HasUnconsumedData(RollingInputBuffer *r, ZSTD_inBuffer *in)
+{
+    return in->pos != in->size || r->has_next;
+}
+
+static inline uint8_t
+InputBuffer_HasNextChunk(RollingInputBuffer *r)
+{
+    return r->has_next;
+}
+
+static inline void
+InputBuffer_Enter(RollingInputBuffer *r, Py_buffer *input,
+                  ZSTD_inBuffer *in)
+{
+    if (r->used == 0) {
+        /* Use input data */
+        r->stage = 2;
+        r->has_next = 0;
+
+        in->src = input->buf;
+        in->size = input->len;
+        in->pos = 0;
+    } else {
+        /* Use buffer */
+        r->stage = 1;
+        r->has_next = r->across || input->len != 0;
+
+        in->src = r->buffer + r->begin;
+        in->size = !r->across ? r->used : (r->buffer_size - r->begin);
+        in->pos = 0;
+    }
+    r->input_data = input;
+}
+
+static inline void
+InputBuffer_NextChunk(RollingInputBuffer *r, ZSTD_inBuffer *in)
+{
+    /* Ensure input data has been consumed */
+    assert(in->pos == in->size);
+    assert(in->size != 0);
+    /* Has data */
+    assert(r->used != 0);
+    assert(r->stage == 1);
+    assert(r->has_next);
+
+    if (!r->across) {
+        /* The last chunk exhausted: ---xxxx--  */
+        r->used = 0;
+        r->begin = 0;
+        r->end = 0;
+
+        r->stage = 2;
+        r->has_next = 0;
+
+        /* Use input data */
+        assert(r->input_data->len != 0);
+        in->src = r->input_data->buf;
+        in->size = r->input_data->len;
+        in->pos = 0;
+    } else {
+        /* The first chunk exhausted: ===--xxxx */
+        r->used = r->end;
+        r->begin = 0;
+        r->across = 0;
+
+        assert(r->stage == 1);
+        r->has_next = r->input_data->len != 0;
+
+        /* Use the second chunk */
+        in->src = r->buffer;
+        in->size = r->end;
+        in->pos = 0;
+    }
+}
+
+/* If has unconsumed data, return 1.
+   If no unconsumed data, return 0.
+   If fails, return -1. */
+static inline int
+InputBuffer_Finish(RollingInputBuffer *r, const ZSTD_inBuffer *in)
+{
+    char *input_data_buffer;
+    size_t input_data_size;
+    size_t new_data_size;
+    int reallocate;
+
+    /* No unconsumed data */
+    if (in->pos == in->size && !r->has_next) {
+        return 0;
+    }
+
+    /* Advance buffer position */
+    if (r->stage == 1) {
+        if (in->pos != 0) {
+            r->used -= in->pos;
+            r->begin += in->pos;
+
+            if (r->used == 0) {
+                /* The last buffer chunk exhausted */
+                assert(!r->across);
+
+                r->begin = 0;
+                r->end = 0;
+            } else if (r->begin == r->buffer_size) {
+                assert(r->across); /* If false, then (r->used == 0). */
+                assert(r->end != 0);
+                assert(r->end == r->used);
+
+                r->begin = 0;
+                r->across = 0;
+            }
+        }
+
+        /* Input data */
+        if (!r->has_next) {
+            assert(in->pos != in->size);
+            return 1;
+        }
+        input_data_buffer = r->input_data->buf;
+        input_data_size = r->input_data->len;
+    } else {
+        assert(r->stage == 2);
+        input_data_buffer = (char*)in->src + in->pos;
+        input_data_size = in->size - in->pos;
+    }
+
+    new_data_size = r->used + input_data_size;
+    if (new_data_size > r->buffer_size) {
+        /* Total space is not enough */
+        reallocate = 1;
+    } else {
+        /* Shrink */
+        if (r->buffer_size >= SHRINK_MIN &&
+            r->buffer_size >= new_data_size * SHRINK_FACTOR)
+        {
+            r->shrink_count++;
+
+            if (r->shrink_count == 10) {
+                reallocate = 1;
+                r->shrink_count = 0;
+            } else {
+                reallocate = 0;
+            }
+        } else {
+            reallocate = 0;
+            r->shrink_count = 0;
+        }
+    }
+
+    if (reallocate) {
+        const size_t new_buffer_size = NEW_BUFFER_SIZE(new_data_size);
+        char *tmp;
+
+        tmp = PyMem_Malloc(new_buffer_size);
+        if (tmp == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+
+        /* Memory copy */
+        if (!r->across) {
+            memcpy(tmp, r->buffer + r->begin, r->used);
+        } else {
+            /* The first part */
+            const size_t first_size = r->buffer_size - r->begin;
+            memcpy(tmp, r->buffer + r->begin, first_size);
+            /* The second part */
+            memcpy(tmp + first_size, r->buffer, r->end);
+
+            r->across = 0;
+        }
+
+        /* Switch to new buffer */
+        PyMem_Free(r->buffer);
+        r->buffer = tmp;
+        r->buffer_size = new_buffer_size;
+
+        r->begin = 0;
+        r->end = r->used;
+    }
+
+    /* Copy input data */
+    if (r->across || (input_data_size <= r->buffer_size - r->end)) {
+        /* Contiguous:
+            1. ====----=== or
+            2. --====----- (tail space is enough) */
+        memcpy(r->buffer + r->end, input_data_buffer, input_data_size);
+        r->used += input_data_size;
+        r->end += input_data_size;
+    } else {
+        /* The first part, can be 0.
+           ----======aaa  */
+        size_t first_size = r->buffer_size - r->end;
+        memcpy(r->buffer + r->end, input_data_buffer, first_size);
+
+        /* The second part, must > 0.
+           bb--======aaa */
+        const size_t second_size = input_data_size - first_size;
+        assert(second_size > 0);
+        memcpy(r->buffer, input_data_buffer + first_size, second_size);
+
+        r->used += input_data_size;
+        r->end = second_size;
+        r->across = 1;
+    }
+
+    return 1;
+}
+
+/* If succeeds, the input buffer will be cleared. */
+static inline PyObject*
+InputBuffer_GetUnusedAndClear(RollingInputBuffer *r)
+{
+    PyObject *ret;
+
+    if (r->used == 0) {
+        /* No unused data */
+        ret = static_state.empty_bytes;
+        Py_INCREF(ret);
+    } else {
+        if (!r->across) {
+            /* Not across */
+            ret = PyBytes_FromStringAndSize(r->buffer + r->begin, r->used);
+        } else {
+            /* Across */
+            ret = PyBytes_FromStringAndSize(NULL, r->used);
+            if (ret == NULL) {
+                return NULL;
+            }
+
+            char* const buf = PyBytes_AS_STRING(ret);
+            const size_t first_size = r->buffer_size - r->begin;
+
+            memcpy(buf, r->buffer + r->begin, first_size);
+            memcpy(buf + first_size, r->buffer, r->end);
+        }
+    }
+
+    /* Free input buffer */
+    if (r->buffer) {
+        PyMem_Free(r->buffer);
+        r->buffer = NULL;
+    }
+
+    return ret;
+}
+
+static inline void
+InputBuffer_OnError(RollingInputBuffer *r)
+{
+    r->used = 0;
+    r->begin = 0;
+    r->end = 0;
+    r->across = 0;
+
+    r->shrink_count = 0;
+}
+
+static inline void
+InputBuffer_Free(RollingInputBuffer *r)
+{
+    PyMem_Free(r->buffer);
 }
 
 /* ------------------
